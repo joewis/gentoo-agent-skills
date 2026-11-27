@@ -42,29 +42,50 @@ df -h /var /usr /var/tmp/portage 2>/dev/null
 echo
 
 # --- 1. Sync repos ---
-echo "[step 1/4] emaint -a sync"
+echo "[step 1/5] emaint -a sync"
 sudo emaint -a sync
 SYNC_EXIT=$?
 echo "sync exit: $SYNC_EXIT"
 echo
 
 # --- 2. Portage self-update ---
-echo "[step 2/4] emerge --oneshot sys-apps/portage"
+echo "[step 2/5] emerge --oneshot sys-apps/portage"
 sudo emerge --oneshot --verbose sys-apps/portage
 PORTAGE_EXIT=$?
 echo "portage exit: $PORTAGE_EXIT"
 echo
 
 # --- 3. Pretend @world (the agent will read this file to see what would change) ---
-echo "[step 3/4] emerge -pv @world"
+echo "[step 3/5] emerge -pv @world"
 sudo emerge --pretend --verbose --update --deep --changed-use @world 2>&1 \
   | tee "$PRETEND_LOG" | tail -50
 PRETEND_COUNT=$(grep -c '^\[ebuild' "$PRETEND_LOG" 2>/dev/null || echo 0)
 echo "would update: $PRETEND_COUNT packages"
 echo
 
-# --- 4. News count (the agent reads each unread item) ---
-echo "[step 4/4] eselect news list"
+# --- 4. Protected config candidates (NEVER auto-merged) ---
+echo "[step 4/5] protected config candidates (._cfg????_*)"
+CFG_LOG="$WORKSPACE/config-candidates.log"
+sudo find /etc -name '._cfg????_*' 2>/dev/null | sort > "$CFG_LOG"
+CFG_COUNT=$(grep -c . "$CFG_LOG" 2>/dev/null || true)
+echo "pending config candidates: ${CFG_COUNT:-0}"
+cat "$CFG_LOG"
+# Files that govern access or boot. Replacing one of these from a diff that was
+# not read in full can lock the operator -- or this agent -- out of the machine.
+CFG_SENSITIVE=$(grep -E '/(sudoers|sudoers\.d/[^/]+|sshd_config|shadow|gshadow|passwd|group|fstab)$|/pam\.d/[^/]+$|/init\.d/[^/]+$' "$CFG_LOG" 2>/dev/null || true)
+CFG_SENSITIVE_COUNT=$(printf '%s\n' "$CFG_SENSITIVE" | grep -c . 2>/dev/null || true)
+if [ "${CFG_SENSITIVE_COUNT:-0}" -gt 0 ]; then
+  echo
+  echo "!! ACCESS-GOVERNING CONFIG CANDIDATES -- review each in full before writing:"
+  echo "$CFG_SENSITIVE"
+  echo "!! sudoers: sudo grep -nE 'NOPASSWD|%wheel' /etc/sudoers    # what would be lost?"
+  echo "!! visudo -cf proves syntax only, never that privileges survive"
+  echo "!! keep privileged grants in /etc/sudoers.d/ so upstream replacements cannot erase them"
+fi
+echo
+
+# --- 5. News count (the agent reads each unread item) ---
+echo "[step 5/5] eselect news list"
 NEWS_LIST=$(sudo eselect news list 2>&1)
 echo "$NEWS_LIST"
 NEWS_UNREAD=$(echo "$NEWS_LIST" | grep -c '^\*')
@@ -79,6 +100,9 @@ cat > "$STATE_FILE" <<EOF
   "portage_exit": $PORTAGE_EXIT,
   "would_update_count": $PRETEND_COUNT,
   "news_unread": $NEWS_UNREAD,
+  "config_candidates": ${CFG_COUNT:-0},
+  "config_candidates_sensitive": ${CFG_SENSITIVE_COUNT:-0},
+  "config_candidates_log": "$CFG_LOG",
   "phase": "preflight_complete",
   "log_file": "$LOG_FILE",
   "pretend_log": "$PRETEND_LOG"
