@@ -1,7 +1,8 @@
 #!/bin/bash
 # Gentoo weekly update — PREFLIGHT PHASE.
 #
-# Runs the bounded steps (sync + portage self-update + pretend @world + news count),
+# Runs the bounded steps (sync + portage self-update + pretend @world + pending
+# config candidates + news count),
 # writes a structured state file, and exits. The LLM agent reads the state and
 # runs the long step (real @world emerge, depclean, eclean, npm, flatpak, kernel).
 #
@@ -59,26 +60,49 @@ echo
 echo "[step 3/5] emerge -pv @world"
 sudo emerge --pretend --verbose --update --deep --changed-use @world 2>&1 \
   | tee "$PRETEND_LOG" | tail -50
-PRETEND_COUNT=$(grep -c '^\[ebuild' "$PRETEND_LOG" 2>/dev/null || echo 0)
+PRETEND_COUNT=$(grep -c '^\[ebuild' "$PRETEND_LOG" 2>/dev/null || true)
 echo "would update: $PRETEND_COUNT packages"
 echo
 
 # --- 4. Protected config candidates (NEVER auto-merged) ---
 echo "[step 4/5] protected config candidates (._cfg????_*)"
 CFG_LOG="$WORKSPACE/config-candidates.log"
-sudo find /etc -name '._cfg????_*' 2>/dev/null | sort > "$CFG_LOG"
+CFG_RAW="$WORKSPACE/.config-candidates.raw"
+# Keep find's own status: "we could not look" must never read as "nothing to see".
+sudo find /etc -name '._cfg????_*' 2>/dev/null > "$CFG_RAW"
+CFG_FIND_EXIT=$?
+sort "$CFG_RAW" > "$CFG_LOG" 2>/dev/null || true
+rm -f "$CFG_RAW"
+if [ "$CFG_FIND_EXIT" -ne 0 ]; then
+  echo "!! find exited $CFG_FIND_EXIT -- this list is INCOMPLETE, not empty"
+fi
 CFG_COUNT=$(grep -c . "$CFG_LOG" 2>/dev/null || true)
 echo "pending config candidates: ${CFG_COUNT:-0}"
 cat "$CFG_LOG"
-# Files that govern access or boot. Replacing one of these from a diff that was
-# not read in full can lock the operator -- or this agent -- out of the machine.
-CFG_SENSITIVE=$(grep -E '/(sudoers|sudoers\.d/[^/]+|sshd_config|shadow|gshadow|passwd|group|fstab)$|/pam\.d/[^/]+$|/init\.d/[^/]+$' "$CFG_LOG" 2>/dev/null || true)
-CFG_SENSITIVE_COUNT=$(printf '%s\n' "$CFG_SENSITIVE" | grep -c . 2>/dev/null || true)
+# Candidates are named <target>._cfg0000_<name> INSIDE the target's own directory,
+# so the file that matters is /etc/._cfg0000_sudoers, not "/etc/sudoers". Judge the
+# real filename after stripping the prefix, and judge drop-in dirs by the parent.
+CFG_SENSITIVE=""
+while IFS= read -r cand; do
+  [ -z "$cand" ] && continue
+  base=${cand##*/}
+  name=${base#._cfg????_}
+  parent=${cand%/*}; parent=${parent##*/}
+  case "$name" in
+    sudoers|sshd_config|shadow|gshadow|passwd|group|fstab)
+      CFG_SENSITIVE+="$cand"$'\n' ;;
+    *)
+      case "$parent" in
+        pam.d|init.d|sudoers.d) CFG_SENSITIVE+="$cand"$'\n' ;;
+      esac ;;
+  esac
+done < "$CFG_LOG"
+CFG_SENSITIVE_COUNT=$(printf '%s' "$CFG_SENSITIVE" | grep -c . 2>/dev/null || true)
 if [ "${CFG_SENSITIVE_COUNT:-0}" -gt 0 ]; then
   echo
   echo "!! ACCESS-GOVERNING CONFIG CANDIDATES -- review each in full before writing:"
-  echo "$CFG_SENSITIVE"
-  echo "!! sudoers: sudo grep -nE 'NOPASSWD|%wheel' /etc/sudoers    # what would be lost?"
+  printf '%s' "$CFG_SENSITIVE"
+  echo "!! sudoers: sudo grep -nE 'NOPASSWD|%wheel|env_keep' /etc/sudoers   # what can be lost?"
   echo "!! visudo -cf proves syntax only, never that privileges survive"
   echo "!! keep privileged grants in /etc/sudoers.d/ so upstream replacements cannot erase them"
 fi
@@ -102,6 +126,7 @@ cat > "$STATE_FILE" <<EOF
   "news_unread": $NEWS_UNREAD,
   "config_candidates": ${CFG_COUNT:-0},
   "config_candidates_sensitive": ${CFG_SENSITIVE_COUNT:-0},
+  "config_find_exit": ${CFG_FIND_EXIT:-1},
   "config_candidates_log": "$CFG_LOG",
   "phase": "preflight_complete",
   "log_file": "$LOG_FILE",
